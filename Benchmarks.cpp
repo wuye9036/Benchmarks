@@ -1,18 +1,10 @@
-#include <utility>
-
-#include <vector>
-#include <algorithm>
-#include <iostream>
-#include <future>
-#include <atomic>
-#include <thread>
-#include <algorithm>
+#include "TextureFetchMark.h"
 #include <tchar.h>
-
-using namespace std;
+#include <cstdlib>
 
 int _tmain(int argc, _TCHAR* argv[])
 {
+	TextureFetchMark();
     system( "pause" );
 	return 0;
 }
