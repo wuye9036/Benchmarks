@@ -24,7 +24,26 @@ struct LinearAddresser
     {
 		x = x < 0 ? 0 : (x > w-1 ? w-1 : x);
 		y = y < 0 ? 0 : (y > h-1 ? h-1 : y);
+
         return y*h+x;
+    }
+
+    static __m128i OffsetV(int x, int y, int w, int h)
+    {
+        int x1 = x+1;
+        int y1 = y+1;
+		x = x < 0 ? 0 : (x > w-1 ? w-1 : x);
+		y = y < 0 ? 0 : (y > h-1 ? h-1 : y);
+        x1 = x1 < 0 ? 0 : (x1 > w-1 ? w-1 : x1);
+		y1 = y1 < 0 ? 0 : (y1 > h-1 ? h-1 : y1);
+
+        __m128i X = _mm_set_epi32(x, x1, x,  x1);
+        __m128i Y = _mm_set_epi32(y,  y, y1, y1);
+        __m128i W = _mm_set1_epi32(w);
+
+        __m128i YW = _mm_mul_epi32(W, Y);
+
+        return _mm_add_epi32(X, YW);
     }
 };
 
@@ -93,12 +112,27 @@ struct TiledAddresser
 	}
 };
 
+inline __m128 _mm_floor_ps2(__m128 const& x)
+{
+    __m128i v0 = _mm_setzero_si128();
+    __m128i v1 = _mm_cmpeq_epi32(v0,v0);
+    __m128i ji = _mm_srli_epi32( v1, 25);
+    __m128 j = *(__m128*)&_mm_slli_epi32( ji, 23); //create vector 1.0f
+    __m128i i = _mm_cvttps_epi32(x);
+    __m128 fi = _mm_cvtepi32_ps(i);
+    __m128 igx = _mm_cmpgt_ps(fi, x);
+    j = _mm_and_ps(igx, j);
+    return _mm_sub_ps(fi, j);
+}
+
 template <typename AddresserT, typename ComponentT>
 class Surface
 {
     int w, h, alignedW, alignedH;
     ComponentT* pixels;
 public:
+    typedef ComponentT ComponentType;
+
 	Surface(int w, int h)
 		:w(w), h(h), pixels(nullptr)
 	{
@@ -118,41 +152,102 @@ public:
 		_aligned_free(pixels);
 	}
 
-	ComponentT GetPixel(float x, float y)
+    template <typename PixelComponentT>
+    inline static PixelComponentT ComputePixel(
+        PixelComponentT* ret,
+        PixelComponentT const* pixels,
+        __m128i const& addr,
+        __m128 const& weights)
+    {
+        *ret =
+			  pixels[addr.m128i_i32[0]] * weights.m128_f32[0]
+			+ pixels[addr.m128i_i32[1]] * weights.m128_f32[1]
+			+ pixels[addr.m128i_i32[2]] * weights.m128_f32[2]
+			+ pixels[addr.m128i_i32[3]] * weights.m128_f32[3];
+    }
+
+    inline static void ComputePixel(
+        eflib::vec4* ret,
+        eflib::vec4 const* pixels,
+        __m128i const& addr,
+        __m128 const& weights)
+    {
+        auto pixels_m128 = reinterpret_cast<__m128 const*>(pixels);
+
+		__m128 sum01 = _mm_add_ps(
+            _mm_mul_ps( pixels_m128[addr.m128i_i32[0]], _mm_set_ps1(weights.m128_f32[0]) ),
+            _mm_mul_ps( pixels_m128[addr.m128i_i32[1]], _mm_set_ps1(weights.m128_f32[1]) )
+            );
+
+        __m128 sum23 = _mm_add_ps(
+            _mm_mul_ps( pixels_m128[addr.m128i_i32[2]], _mm_set_ps1(weights.m128_f32[2]) ),
+            _mm_mul_ps( pixels_m128[addr.m128i_i32[3]], _mm_set_ps1(weights.m128_f32[3]) )
+            );
+
+        *(reinterpret_cast<__m128*>(ret)) = _mm_add_ps(sum01, sum23);
+    }
+
+    inline static float ComputePixel(
+        float const* pixels,
+        __m128i const& addr,
+        __m128 const& weights)
+    {
+        __m128 samples = _mm_set_ps(
+            pixels[addr.m128i_i32[0]],
+            pixels[addr.m128i_i32[1]],
+            pixels[addr.m128i_i32[2]],
+            pixels[addr.m128i_i32[3]]
+        );
+        __m128 mulSamples = _mm_mul_ps(samples, weights);
+        __m128 ret = _mm_hadd_ps(mulSamples, mulSamples);
+        return ret.m128_f32[0] + ret.m128_f32[1];
+    }
+
+    void GetPixel(ComponentT* p0, ComponentT* p1, __m128 const& coord)
 	{
-		auto xPixels = ( x - floor(x) ) * alignedW - 0.5f;
-		auto yPixels = ( y - floor(y) ) * alignedH - 0.5f;
+        __m128  coordFloor   = _mm_floor_ps(coord);
+        __m128  wrappedCoord = _mm_sub_ps(coord, coordFloor);
+        __m128i alignedSizeI = _mm_set_epi32(alignedW, alignedH, alignedW, alignedH);
+        __m128  alignedSize  = _mm_cvtepi32_ps(alignedSizeI);
+        __m128  pixelCoord   = _mm_mul_ps(wrappedCoord, alignedSize);
+        pixelCoord           = _mm_sub_ps( pixelCoord, _mm_set_ps1(0.5f) );
+        __m128  pixelCoordFlr= _mm_floor_ps(pixelCoord);
+        __m128i pixelCoordI  = _mm_cvtps_epi32(pixelCoordFlr);
+        __m128  pixelCoordFra= _mm_sub_ps(pixelCoord, pixelCoordFlr);
 
-		int xFloor = static_cast<int>(floor(xPixels));
-		int yFloor = static_cast<int>(floor(yPixels));
-		float xFrac = xPixels - xFloor;
-		float yFrac = yPixels - yFloor;
+        {
+            int xFloor = pixelCoordI.m128i_i32[0];
+            int yFloor = pixelCoordI.m128i_i32[1];
+            float xFrac = pixelCoordFra.m128_f32[0];
+            float yFrac = pixelCoordFra.m128_f32[1];
 
-		int address00 = AddresserT::Offset(xFloor,   yFloor,   alignedW, alignedH);
-		_mm_prefetch( reinterpret_cast<char*>(address00+pixels), 0 );
+            __m128i addrs = AddresserT::OffsetV(xFloor, yFloor, alignedW, alignedH);
 
-		int address01 = AddresserT::Offset(xFloor+1, yFloor,   alignedW, alignedH);
-		_mm_prefetch( reinterpret_cast<char*>(address01+pixels), 0 );
+            __m128 weights;
+            weights.m128_f32[3] = xFrac * yFrac;
+		    weights.m128_f32[0] = 1.0f - xFrac - yFrac + weights.m128_f32[3];
+		    weights.m128_f32[1] = xFrac - weights.m128_f32[3];
+		    weights.m128_f32[2] = yFrac - weights.m128_f32[3];
 
-		int address10 = AddresserT::Offset(xFloor,   yFloor+1, alignedW, alignedH);
-		_mm_prefetch( reinterpret_cast<char*>(address10+pixels), 0 );
+            ComputePixel(p0, pixels, addrs, weights);
+        }
 
-		int address11 = AddresserT::Offset(xFloor+1, yFloor+1, alignedW, alignedH);
-		_mm_prefetch( reinterpret_cast<char*>(address11+pixels), 0 );
+        {
+            int xFloor = pixelCoordI.m128i_i32[2];
+            int yFloor = pixelCoordI.m128i_i32[3];
+            float xFrac = pixelCoordFra.m128_f32[2];
+            float yFrac = pixelCoordFra.m128_f32[3];
 
-		auto weight11 = xFrac * yFrac;
-		auto weight00 = 1.0f - xFrac - yFrac + weight11;
-		auto weight01 = xFrac - weight11;
-		auto weight10 = yFrac - weight11;
+            __m128i addrs = AddresserT::OffsetV(xFloor, yFloor, alignedW, alignedH);
 
-		auto pixel
-			= pixels[address00] * weight00
-			+ pixels[address01] * weight01
-			+ pixels[address10] * weight10
-			+ pixels[address11] * weight11;
+            __m128 weights;
+            weights.m128_f32[3] = xFrac * yFrac;
+		    weights.m128_f32[0] = 1.0f - xFrac - yFrac + weights.m128_f32[3];
+		    weights.m128_f32[1] = xFrac - weights.m128_f32[3];
+		    weights.m128_f32[2] = yFrac - weights.m128_f32[3];
 
-		// printf("%4d,%4d,%4d,%4d\n", address00, address01, address10, address11);
-		return pixel;
+            ComputePixel(p1, pixels, addrs, weights);
+        }
 	}
 };
 
@@ -170,7 +265,7 @@ int TestFunction(SurfaceT& surf, int textureSize, int quadSize, int angularParts
 		float sinA = sin(angular / 360 * 2 * 3.1415926f);
 		float cosA = cos(angular / 360 * 2 * 3.1415926f);
 
-		for(int scalePow = -halfScaleParts; scalePow <= halfScaleParts; ++scalePow)
+		for(int scalePow = 1; scalePow < halfScaleParts+2; ++scalePow)
 		{
 			float dirLength = pixelWidth * pow(scaleBase, scalePow);
 			float dirX = sinA * dirLength;
@@ -180,10 +275,17 @@ int TestFunction(SurfaceT& surf, int textureSize, int quadSize, int angularParts
 			{
 				for(int i = iStart; i < iEnd; ++i)
 				{
-					for(int j = jStart; j < jEnd; ++j)
+					for(int j = jStart; j < jEnd; j+=2)
 					{
-						auto pixel = surf.GetPixel(i*dirX, j*dirY);
-						antiOpt += *reinterpret_cast<float*>(&pixel);
+                        __m128 coord;
+                        coord.m128_f32[0] = i*dirX;
+                        coord.m128_f32[1] = j*dirY;
+                        coord.m128_f32[2] = i*dirX;
+                        coord.m128_f32[3] = coord.m128_f32[1] + dirY;
+                        __declspec(align(16)) typename SurfaceT::ComponentType p0, p1;
+                        surf.GetPixel(&p0, &p1, coord);
+						antiOpt += *reinterpret_cast<float*>(&p0);
+                        antiOpt += *reinterpret_cast<float*>(&p1);
 					}
 				}
 			};
@@ -220,15 +322,15 @@ int TestFunction(SurfaceT& surf, int textureSize, int quadSize, int angularParts
 int TextureFetchMark()
 {
 	{
-		int textureSize = 2048;
-		int quadSize = 512;
-		int halfScalePowParts = 2;
+		int textureSize = 8192;
+		int quadSize = 2048;
+		int halfScalePowParts = 4;
 		int angularParts = 1;
 		
-		int totalPixels = quadSize * quadSize * ( halfScalePowParts * 2 + 1) * angularParts;
+		int totalPixels = quadSize * quadSize * ( halfScalePowParts + 2) * angularParts;
 		
 		cout << "Initializing ... " << endl;
-		Surface<MortonAddresser, float> surf(textureSize, textureSize);
+        Surface<LinearAddresser, eflib::vec4> surf(textureSize, textureSize);
 
 		cout << "Running ... " << endl;
 		auto Surf1x1_Linear_Float = [=, &surf]() -> void
